@@ -1,13 +1,81 @@
-// This is your Prisma schema file,
-// learn more about it in the docs: https://pris.ly/d/prisma-schema
-
-// Get a free hosted Postgres database in seconds: `npx create-db`
-
 generator client {
-  provider = "prisma-client"
-  output   = "../src/generated/prisma"
+  provider = "prisma-client-js"
 }
 
 datasource db {
-  provider = "postgresql"
+provider = "postgresql"
+}
+
+model User {
+  id        String        @id @default(uuid())
+  email     String        @unique
+  password  String
+  createdAt DateTime      @default(now())
+  attempts  QuizAttempt[]
+  progress  Progress[]
+}
+
+model Subject {
+  id        String     @id @default(uuid())
+  name      String     @unique
+  icon      String?    // e.g. emoji or icon key for the subject card UI
+  color     String?    // hex code for the card's theme color
+  questions Question[]
+  progress  Progress[]
+}
+
+model Question {
+  id          String      @id @default(uuid())
+  subjectId   String
+  subject     Subject     @relation(fields: [subjectId], references: [id])
+  text        String
+  choices     String[]
+  correctIdx  Int
+  difficulty  Int         @default(1) // 1=easy, 2=medium, 3=hard — useful later for adaptive quizzes
+  createdAt   DateTime    @default(now())
+  answers     Answer[]
+
+  @@index([subjectId])
+}
+
+model QuizAttempt {
+  id        String    @id @default(uuid())
+  userId    String
+  user      User      @relation(fields: [userId], references: [id])
+  subjectId String
+  score     Int
+  total     Int
+  startedAt DateTime  @default(now())
+  endedAt   DateTime?
+  answers   Answer[]
+
+  @@index([userId])
+  @@index([subjectId])
+}
+
+model Answer {
+  id            String       @id @default(uuid())
+  attemptId     String
+  attempt       QuizAttempt  @relation(fields: [attemptId], references: [id])
+  questionId    String
+  question      Question     @relation(fields: [questionId], references: [id])
+  selectedIdx   Int
+  isCorrect     Boolean
+  timeTakenMs   Int?
+
+  @@index([attemptId])
+}
+
+model Progress {
+  id           String   @id @default(uuid())
+  userId       String
+  user         User     @relation(fields: [userId], references: [id])
+  subjectId    String
+  subject      Subject  @relation(fields: [subjectId], references: [id])
+  masteryPct   Float    @default(0)
+  currentStreak Int     @default(0)
+  bestStreak   Int      @default(0)
+  lastPlayedAt DateTime?
+
+  @@unique([userId, subjectId])
 }
