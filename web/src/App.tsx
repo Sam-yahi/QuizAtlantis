@@ -317,11 +317,11 @@ function Round({ game, state, config }: { game: Game; state: GameState; config: 
       const idx = ['1', '2', '3', '4'].indexOf(e.key)
       const letterIdx = LETTERS.indexOf(e.key.toUpperCase())
       const choice = idx >= 0 ? idx : letterIdx
-      if (choice >= 0 && choice < q.choices.length) answer(choice)
+      if (choice >= 0 && choice < q.choices.length) answer(choice, q.index)
     }
     window.addEventListener('keydown', onKey)
     return () => window.removeEventListener('keydown', onKey)
-  }, [canAnswer, q.choices.length, answer])
+  }, [canAnswer, q.choices.length, q.index, answer])
 
   let feedback
   if (reveal) {
@@ -365,7 +365,7 @@ function Round({ game, state, config }: { game: Game; state: GameState; config: 
           if (reveal) classes.push(i === reveal.correctIdx ? 'correct' : 'wrong')
           else if (myAnswer !== null && myAnswer !== i) classes.push('dimmed')
           return (
-            <button key={i} className={classes.join(' ')} disabled={!canAnswer} onClick={() => answer(i)}>
+            <button key={i} className={classes.join(' ')} disabled={!canAnswer} onClick={() => answer(i, q.index)}>
               <span className="letter">{LETTERS[i]}</span>
               <span className="answer-text">{choice}</span>
               {reveal && (

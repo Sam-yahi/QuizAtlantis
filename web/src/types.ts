@@ -35,6 +35,7 @@ export interface PlayerView {
 }
 
 export interface GameState {
+  version: number
   pin: string
   phase: Phase
   you: string
@@ -56,6 +57,6 @@ export interface GameState {
   reveal: { correctIdx: number; counts: number[]; isLast: boolean } | null
 }
 
-export type JoinResult =
-  | { ok: true; pin: string; playerId: string; token: string }
-  | { ok: false; error: string }
+export type EnterResult =
+  | { ok: true; pin: string; token: string; state: GameState }
+  | { ok: false; error?: string }

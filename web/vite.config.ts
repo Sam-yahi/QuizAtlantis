@@ -9,9 +9,6 @@ export default defineConfig({
   server: {
     // Listen on the LAN so phones on the same Wi-Fi can join a game.
     host: true,
-    proxy: {
-      '/api': API,
-      '/socket.io': { target: API, ws: true },
-    },
+    proxy: { '/api': API },
   },
 })

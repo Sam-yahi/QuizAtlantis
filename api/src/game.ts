@@ -1,5 +1,6 @@
 import { randomInt, randomUUID } from 'crypto';
 import { CATEGORIES, QUESTION_BANK } from './questions';
+import type { Store } from './store';
 
 export const MAX_PLAYERS = 8;
 export const QUESTION_COUNTS = [5, 10, 15, 20];
@@ -7,7 +8,10 @@ export const TIME_LIMITS = [10, 15, 20, 30];
 
 const STARTING_MS = 3000;
 const REVEAL_MS = 6000;
-const EMPTY_ROOM_TTL_MS = 2 * 60 * 1000;
+/** Clients poll at least every 2s; after this long without a poll a player shows as offline. */
+const OFFLINE_AFTER_MS = 6000;
+/** After this long without a poll a player is dropped from the lobby / loses host. */
+const GONE_AFTER_MS = 20000;
 const AVATARS = ['🐙', '🦈', '🐬', '🐢', '🦀', '🐡', '🦑', '🐳'];
 const CATEGORY_IDS = new Set(CATEGORIES.map((c) => c.id));
 
@@ -26,43 +30,38 @@ interface DealtQuestion {
   correctIdx: number;
 }
 
-interface PlayerAnswer {
-  choice: number;
-  correct: boolean;
-  points: number;
-}
-
 interface Player {
   id: string;
+  /** Secret that identifies this player's requests. Never sent to other players. */
   token: string;
   name: string;
   avatar: string;
-  socketId: string | null;
+  joinedAt: number;
   score: number;
   streak: number;
   correctCount: number;
-  answer: PlayerAnswer | null;
+  answer: { choice: number; correct: boolean; points: number } | null;
 }
 
+/** Everything about a game. Stored as one JSON document; nothing lives in process memory. */
 interface Room {
+  version: number;
   pin: string;
   hostId: string;
-  players: Map<string, Player>;
+  players: Player[];
   settings: Settings;
   phase: Phase;
   questions: DealtQuestion[];
   qIndex: number;
   phaseStartedAt: number;
   phaseEndsAt: number;
-  timer: NodeJS.Timeout | null;
-  cleanupTimer: NodeJS.Timeout | null;
 }
 
-export type Result<T> = ({ ok: true } & T) | { ok: false; error: string };
-type Session = { pin: string; playerId: string; token: string };
-
-/** Sends a personalised snapshot to one socket. */
-export type Emit = (socketId: string, snapshot: unknown) => void;
+type Seen = Record<string, number>;
+export type Snapshot = ReturnType<typeof snapshot>;
+export type EnterResult =
+  | { ok: true; pin: string; token: string; state: Snapshot }
+  | { ok: false; error: string };
 
 function shuffle<T>(items: T[]): T[] {
   const a = [...items];
@@ -109,282 +108,294 @@ function dealQuestions(settings: Settings): DealtQuestion[] {
   });
 }
 
-export class GameManager {
-  private rooms = new Map<string, Room>();
-  private socketIndex = new Map<string, { pin: string; playerId: string }>();
+function newPlayer(room: Room, name: string, now: number): Player {
+  const used = new Set(room.players.map((p) => p.avatar));
+  return {
+    id: randomUUID(),
+    token: randomUUID(),
+    name,
+    avatar: AVATARS.find((a) => !used.has(a)) ?? AVATARS[0],
+    joinedAt: now,
+    score: 0,
+    streak: 0,
+    correctCount: 0,
+    answer: null,
+  };
+}
 
-  constructor(private emit: Emit) {}
+function resetScores(room: Room) {
+  for (const p of room.players) {
+    p.score = 0;
+    p.streak = 0;
+    p.correctCount = 0;
+    p.answer = null;
+  }
+}
 
-  createRoom(socketId: string, rawName: unknown, rawSettings: unknown): Result<Session> {
+function setPhase(room: Room, phase: Phase, startsAt: number, durationMs = 0) {
+  room.phase = phase;
+  room.phaseStartedAt = startsAt;
+  room.phaseEndsAt = startsAt + durationMs;
+}
+
+function beginQuestion(room: Room, at: number) {
+  for (const p of room.players) p.answer = null;
+  setPhase(room, 'question', at, room.settings.timeLimit * 1000);
+}
+
+function endQuestion(room: Room, at: number) {
+  for (const p of room.players) {
+    if (p.answer?.correct) {
+      p.score += p.answer.points;
+      p.streak += 1;
+      p.correctCount += 1;
+    } else {
+      p.streak = 0;
+    }
+  }
+  setPhase(room, 'reveal', at, REVEAL_MS);
+}
+
+/**
+ * Brings a room up to date with the clock. There are no server timers: every request
+ * calls this first, and it applies whatever phase changes are due. Timed phases start
+ * exactly when the previous one was scheduled to end, however late the request arrives.
+ */
+function advance(room: Room, seen: Seen, now: number) {
+  const lastSeen = (p: Player) => Math.max(seen[p.token] ?? 0, p.joinedAt);
+  const online = (p: Player) => now - lastSeen(p) < OFFLINE_AFTER_MS;
+  const gone = (p: Player) => now - lastSeen(p) > GONE_AFTER_MS;
+
+  if (room.phase === 'lobby') {
+    const staying = room.players.filter((p) => !gone(p));
+    if (staying.length > 0) room.players = staying;
+  }
+  const host = room.players.find((p) => p.id === room.hostId);
+  if (!host || gone(host)) {
+    room.hostId = (room.players.find(online) ?? room.players[0]).id;
+  }
+
+  for (;;) {
+    const due = now >= room.phaseEndsAt;
+    if (room.phase === 'starting' && due) {
+      beginQuestion(room, room.phaseEndsAt);
+    } else if (room.phase === 'question' && due) {
+      endQuestion(room, room.phaseEndsAt);
+    } else if (room.phase === 'question') {
+      const active = room.players.filter(online);
+      if (active.length === 0 || !active.every((p) => p.answer)) break;
+      endQuestion(room, now);
+    } else if (room.phase === 'reveal' && due) {
+      if (room.qIndex >= room.questions.length - 1) {
+        setPhase(room, 'finished', room.phaseEndsAt);
+      } else {
+        room.qIndex += 1;
+        beginQuestion(room, room.phaseEndsAt);
+      }
+    } else {
+      break;
+    }
+  }
+}
+
+/** What one player is allowed to see right now — never the correct answer before the reveal. */
+function snapshot(room: Room, me: Player, seen: Seen, now: number) {
+  const inRound = room.phase === 'question' || room.phase === 'reveal';
+  const revealed = room.phase === 'reveal';
+  const q = inRound ? room.questions[room.qIndex] : null;
+  return {
+    version: room.version,
+    pin: room.pin,
+    phase: room.phase,
+    you: me.id,
+    hostId: room.hostId,
+    maxPlayers: MAX_PLAYERS,
+    settings: room.settings,
+    serverNow: now,
+    phaseStartedAt: room.phaseStartedAt,
+    phaseEndsAt: room.phaseEndsAt,
+    players: room.players.map((p) => ({
+      id: p.id,
+      name: p.name,
+      avatar: p.avatar,
+      score: p.score,
+      streak: p.streak,
+      correctCount: p.correctCount,
+      connected: p === me || now - Math.max(seen[p.token] ?? 0, p.joinedAt) < OFFLINE_AFTER_MS,
+      answered: inRound && p.answer !== null,
+      lastPoints: revealed ? (p.answer?.points ?? 0) : null,
+      lastCorrect: revealed ? (p.answer?.correct ?? false) : null,
+    })),
+    question: q && {
+      index: room.qIndex,
+      total: room.questions.length,
+      category: q.category,
+      text: q.text,
+      choices: q.choices,
+    },
+    myAnswer: inRound ? (me.answer?.choice ?? null) : null,
+    reveal:
+      q && revealed
+        ? {
+            correctIdx: q.correctIdx,
+            counts: q.choices.map((_, i) => room.players.filter((p) => p.answer?.choice === i).length),
+            isLast: room.qIndex >= room.questions.length - 1,
+          }
+        : null,
+  };
+}
+
+type Action = (room: Room, me: Player, now: number, seen: Seen) => void;
+
+export class Game {
+  constructor(private store: Store) {}
+
+  async createRoom(rawName: unknown, rawSettings: unknown): Promise<EnterResult> {
     const name = cleanName(rawName);
     if (!name) return { ok: false, error: 'Pick a name between 1 and 16 characters.' };
     const settings = cleanSettings(rawSettings);
     if (!settings) return { ok: false, error: 'Pick at least one category.' };
-    this.detach(socketId);
 
-    let pin: string;
-    do pin = String(randomInt(100000, 1000000));
-    while (this.rooms.has(pin));
-
-    const room: Room = {
-      pin,
-      hostId: '',
-      players: new Map(),
-      settings,
-      phase: 'lobby',
-      questions: [],
-      qIndex: 0,
-      phaseStartedAt: Date.now(),
-      phaseEndsAt: 0,
-      timer: null,
-      cleanupTimer: null,
-    };
-    this.rooms.set(pin, room);
-    const player = this.addPlayer(room, socketId, name);
-    room.hostId = player.id;
-    this.broadcast(room);
-    return { ok: true, pin, playerId: player.id, token: player.token };
-  }
-
-  joinRoom(socketId: string, rawPin: unknown, rawName: unknown): Result<Session> {
-    const name = cleanName(rawName);
-    if (!name) return { ok: false, error: 'Pick a name between 1 and 16 characters.' };
-    const room = this.rooms.get(String(rawPin ?? '').trim());
-    if (!room) return { ok: false, error: 'No game found with that PIN.' };
-    if (room.phase !== 'lobby') return { ok: false, error: 'That game has already started.' };
-    if (room.players.size >= MAX_PLAYERS) {
-      return { ok: false, error: `That game is full (${MAX_PLAYERS} players max).` };
-    }
-    const taken = [...room.players.values()].some((p) => p.name.toLowerCase() === name.toLowerCase());
-    if (taken) return { ok: false, error: 'Someone in that game already has this name.' };
-    this.detach(socketId);
-
-    const player = this.addPlayer(room, socketId, name);
-    this.broadcast(room);
-    return { ok: true, pin: room.pin, playerId: player.id, token: player.token };
-  }
-
-  /** Re-attaches a player after a refresh or dropped connection. */
-  rejoin(socketId: string, rawPin: unknown, rawToken: unknown): Result<Session> {
-    const room = this.rooms.get(String(rawPin ?? ''));
-    const player = room && [...room.players.values()].find((p) => p.token === rawToken);
-    if (!room || !player) return { ok: false, error: 'That game is no longer available.' };
-    this.detach(socketId);
-    if (player.socketId) this.socketIndex.delete(player.socketId);
-    player.socketId = socketId;
-    this.socketIndex.set(socketId, { pin: room.pin, playerId: player.id });
-    if (room.cleanupTimer) {
-      clearTimeout(room.cleanupTimer);
-      room.cleanupTimer = null;
-    }
-    this.broadcast(room);
-    return { ok: true, pin: room.pin, playerId: player.id, token: player.token };
-  }
-
-  updateSettings(socketId: string, rawSettings: unknown) {
-    const ctx = this.context(socketId);
-    const settings = cleanSettings(rawSettings);
-    if (!ctx || !settings || ctx.room.phase !== 'lobby' || ctx.room.hostId !== ctx.player.id) return;
-    ctx.room.settings = settings;
-    this.broadcast(ctx.room);
-  }
-
-  start(socketId: string) {
-    const ctx = this.context(socketId);
-    if (!ctx || ctx.room.phase !== 'lobby' || ctx.room.hostId !== ctx.player.id) return;
-    const { room } = ctx;
-    room.questions = dealQuestions(room.settings);
-    room.qIndex = 0;
-    for (const p of room.players.values()) {
-      p.score = 0;
-      p.streak = 0;
-      p.correctCount = 0;
-      p.answer = null;
-    }
-    this.setPhase(room, 'starting', STARTING_MS, () => this.beginQuestion(room));
-  }
-
-  answer(socketId: string, rawChoice: unknown) {
-    const ctx = this.context(socketId);
-    if (!ctx || ctx.room.phase !== 'question' || ctx.player.answer) return;
-    const { room, player } = ctx;
-    const question = room.questions[room.qIndex];
-    const choice = Number(rawChoice);
-    if (!Number.isInteger(choice) || choice < 0 || choice >= question.choices.length) return;
-
-    const duration = room.phaseEndsAt - room.phaseStartedAt;
-    const elapsed = Math.min(Math.max(Date.now() - room.phaseStartedAt, 0), duration);
-    const correct = choice === question.correctIdx;
-    // Correct answers earn 500–1000 depending on speed, plus up to 500 for a streak.
-    const speedPoints = Math.round(1000 * (1 - elapsed / duration / 2));
-    const streakBonus = Math.min(player.streak, 5) * 100;
-    player.answer = { choice, correct, points: correct ? speedPoints + streakBonus : 0 };
-
-    if (this.everyoneAnswered(room)) this.endQuestion(room);
-    else this.broadcast(room);
-  }
-
-  playAgain(socketId: string) {
-    const ctx = this.context(socketId);
-    if (!ctx || ctx.room.phase !== 'finished' || ctx.room.hostId !== ctx.player.id) return;
-    const { room } = ctx;
-    for (const p of [...room.players.values()]) {
-      if (!p.socketId) room.players.delete(p.id);
-      p.score = 0;
-      p.streak = 0;
-      p.correctCount = 0;
-      p.answer = null;
-    }
-    this.setPhase(room, 'lobby');
-  }
-
-  /** Called on explicit leave and on socket disconnect. */
-  leave(socketId: string, explicit: boolean) {
-    const ctx = this.context(socketId);
-    if (!ctx) return;
-    const { room, player } = ctx;
-    this.socketIndex.delete(socketId);
-    player.socketId = null;
-    // Mid-game we keep the player (and their score) so they can reconnect.
-    if (explicit || room.phase === 'lobby') room.players.delete(player.id);
-
-    const connected = [...room.players.values()].filter((p) => p.socketId);
-    if (connected.length === 0) {
-      if (room.players.size === 0) return this.destroy(room);
-      room.cleanupTimer ??= setTimeout(() => this.destroy(room), EMPTY_ROOM_TTL_MS);
-      return;
-    }
-    if (!room.players.get(room.hostId)?.socketId) room.hostId = connected[0].id;
-    if (room.phase === 'question' && this.everyoneAnswered(room)) this.endQuestion(room);
-    else this.broadcast(room);
-  }
-
-  // ---- internals ----
-
-  private addPlayer(room: Room, socketId: string, name: string): Player {
-    const used = new Set([...room.players.values()].map((p) => p.avatar));
-    const player: Player = {
-      id: randomUUID(),
-      token: randomUUID(),
-      name,
-      avatar: AVATARS.find((a) => !used.has(a)) ?? AVATARS[0],
-      socketId,
-      score: 0,
-      streak: 0,
-      correctCount: 0,
-      answer: null,
-    };
-    room.players.set(player.id, player);
-    this.socketIndex.set(socketId, { pin: room.pin, playerId: player.id });
-    return player;
-  }
-
-  private context(socketId: string) {
-    const ref = this.socketIndex.get(socketId);
-    const room = ref && this.rooms.get(ref.pin);
-    const player = room && room.players.get(ref.playerId);
-    return room && player ? { room, player } : null;
-  }
-
-  /** A socket can only be in one room: drop it from any previous one. */
-  private detach(socketId: string) {
-    if (this.socketIndex.has(socketId)) this.leave(socketId, true);
-  }
-
-  private everyoneAnswered(room: Room) {
-    const connected = [...room.players.values()].filter((p) => p.socketId);
-    return connected.length > 0 && connected.every((p) => p.answer);
-  }
-
-  private setPhase(room: Room, phase: Phase, durationMs = 0, next?: () => void) {
-    if (room.timer) clearTimeout(room.timer);
-    room.phase = phase;
-    room.phaseStartedAt = Date.now();
-    room.phaseEndsAt = room.phaseStartedAt + durationMs;
-    room.timer = next ? setTimeout(next, durationMs) : null;
-    this.broadcast(room);
-  }
-
-  private beginQuestion(room: Room) {
-    for (const p of room.players.values()) p.answer = null;
-    this.setPhase(room, 'question', room.settings.timeLimit * 1000, () => this.endQuestion(room));
-  }
-
-  private endQuestion(room: Room) {
-    for (const p of room.players.values()) {
-      if (p.answer?.correct) {
-        p.score += p.answer.points;
-        p.streak += 1;
-        p.correctCount += 1;
-      } else {
-        p.streak = 0;
+    for (let attempt = 0; attempt < 10; attempt++) {
+      const now = Date.now();
+      const room: Room = {
+        version: 1,
+        pin: String(randomInt(100000, 1000000)),
+        hostId: '',
+        players: [],
+        settings,
+        phase: 'lobby',
+        questions: [],
+        qIndex: 0,
+        phaseStartedAt: now,
+        phaseEndsAt: now,
+      };
+      const me = newPlayer(room, name, now);
+      room.players.push(me);
+      room.hostId = me.id;
+      if (await this.store.create(room.pin, JSON.stringify(room), me.token, now)) {
+        return { ok: true, pin: room.pin, token: me.token, state: snapshot(room, me, {}, now) };
       }
     }
-    const isLast = room.qIndex >= room.questions.length - 1;
-    this.setPhase(room, 'reveal', REVEAL_MS, () => {
-      if (isLast) return this.setPhase(room, 'finished');
-      room.qIndex += 1;
-      this.beginQuestion(room);
+    return { ok: false, error: 'Could not create a game. Please try again.' };
+  }
+
+  async joinRoom(rawPin: unknown, rawName: unknown): Promise<EnterResult> {
+    const name = cleanName(rawName);
+    if (!name) return { ok: false, error: 'Pick a name between 1 and 16 characters.' };
+    const pin = String(rawPin ?? '').trim();
+    if (!/^\d{6}$/.test(pin)) return { ok: false, error: 'No game found with that PIN.' };
+
+    // Retried when another request changes the room first, so two people can't take the last seat.
+    for (let attempt = 0; attempt < 8; attempt++) {
+      const { raw, seen } = await this.store.load(pin);
+      if (!raw) return { ok: false, error: 'No game found with that PIN.' };
+      const room: Room = JSON.parse(raw);
+      const now = Date.now();
+      advance(room, seen, now);
+      if (room.phase !== 'lobby') return { ok: false, error: 'That game has already started.' };
+      if (room.players.length >= MAX_PLAYERS) {
+        return { ok: false, error: `That game is full (${MAX_PLAYERS} players max).` };
+      }
+      if (room.players.some((p) => p.name.toLowerCase() === name.toLowerCase())) {
+        return { ok: false, error: 'Someone in that game already has this name.' };
+      }
+      const me = newPlayer(room, name, now);
+      room.players.push(me);
+      room.version += 1;
+      if (await this.store.replace(pin, raw, JSON.stringify(room))) {
+        return { ok: true, pin, token: me.token, state: snapshot(room, me, seen, now) };
+      }
+    }
+    return { ok: false, error: 'The game is busy. Please try again.' };
+  }
+
+  /** The poll every client makes about once a second. Returns null if the player isn't in the room. */
+  state(pin: string, token: string) {
+    return this.update(pin, token, () => {});
+  }
+
+  updateSettings(pin: string, token: string, rawSettings: unknown) {
+    return this.update(pin, token, (room, me) => {
+      const settings = cleanSettings(rawSettings);
+      if (settings && room.phase === 'lobby' && room.hostId === me.id) room.settings = settings;
     });
   }
 
-  private destroy(room: Room) {
-    if (room.timer) clearTimeout(room.timer);
-    if (room.cleanupTimer) clearTimeout(room.cleanupTimer);
-    for (const p of room.players.values()) if (p.socketId) this.socketIndex.delete(p.socketId);
-    this.rooms.delete(room.pin);
+  start(pin: string, token: string) {
+    return this.update(pin, token, (room, me, now) => {
+      if (room.phase !== 'lobby' || room.hostId !== me.id) return;
+      room.questions = dealQuestions(room.settings);
+      room.qIndex = 0;
+      resetScores(room);
+      setPhase(room, 'starting', now, STARTING_MS);
+    });
   }
 
-  private broadcast(room: Room) {
-    for (const p of room.players.values()) {
-      if (p.socketId) this.emit(p.socketId, this.snapshot(room, p));
+  answer(pin: string, token: string, rawChoice: unknown, rawQuestionIndex: unknown) {
+    return this.update(pin, token, (room, me, now) => {
+      // The question index guards against a late answer landing on the next question.
+      if (room.phase !== 'question' || rawQuestionIndex !== room.qIndex || me.answer) return;
+      const question = room.questions[room.qIndex];
+      const choice = Number(rawChoice);
+      if (!Number.isInteger(choice) || choice < 0 || choice >= question.choices.length) return;
+
+      const duration = room.phaseEndsAt - room.phaseStartedAt;
+      const elapsed = Math.min(Math.max(now - room.phaseStartedAt, 0), duration);
+      const correct = choice === question.correctIdx;
+      // Correct answers earn 500–1000 depending on speed, plus up to 500 for a streak.
+      const speedPoints = Math.round(1000 * (1 - elapsed / duration / 2));
+      const streakBonus = Math.min(me.streak, 5) * 100;
+      me.answer = { choice, correct, points: correct ? speedPoints + streakBonus : 0 };
+    });
+  }
+
+  playAgain(pin: string, token: string) {
+    return this.update(pin, token, (room, me, now, seen) => {
+      if (room.phase !== 'finished' || room.hostId !== me.id) return;
+      room.players = room.players.filter(
+        (p) => p === me || now - Math.max(seen[p.token] ?? 0, p.joinedAt) < OFFLINE_AFTER_MS,
+      );
+      resetScores(room);
+      setPhase(room, 'lobby', now);
+    });
+  }
+
+  async leave(pin: string, token: string) {
+    await this.update(pin, token, (room, me) => {
+      room.players = room.players.filter((p) => p !== me);
+    });
+  }
+
+  /**
+   * Load → bring up to date → apply the action → write back. If another request changed
+   * the room in between, the write is refused and the whole thing is retried on fresh data.
+   */
+  private async update(pin: string, token: string, action: Action): Promise<Snapshot | null> {
+    if (!/^\d{6}$/.test(pin) || !token) return null;
+    for (let attempt = 0; attempt < 8; attempt++) {
+      const now = Date.now();
+      const { raw, seen } = await this.store.load(pin, token, now);
+      if (!raw) return null;
+      const room: Room = JSON.parse(raw);
+      const me = room.players.find((p) => p.token === token);
+      if (!me) return null;
+
+      advance(room, seen, now);
+      action(room, me, now, seen);
+      if (room.players.length === 0) {
+        await this.store.remove(pin);
+        return null;
+      }
+      // An action can make more changes due (e.g. the last answer ends the question).
+      advance(room, seen, now);
+
+      if (JSON.stringify(room) === raw) return snapshot(room, me, seen, now);
+      room.version += 1;
+      if (await this.store.replace(pin, raw, JSON.stringify(room))) {
+        return room.players.includes(me) ? snapshot(room, me, seen, now) : null;
+      }
     }
-  }
-
-  /** What one player is allowed to see right now — never the correct answer before the reveal. */
-  private snapshot(room: Room, me: Player) {
-    const inRound = room.phase === 'question' || room.phase === 'reveal';
-    const revealed = room.phase === 'reveal';
-    const q = inRound ? room.questions[room.qIndex] : null;
-    return {
-      pin: room.pin,
-      phase: room.phase,
-      you: me.id,
-      hostId: room.hostId,
-      maxPlayers: MAX_PLAYERS,
-      settings: room.settings,
-      serverNow: Date.now(),
-      phaseStartedAt: room.phaseStartedAt,
-      phaseEndsAt: room.phaseEndsAt,
-      players: [...room.players.values()].map((p) => ({
-        id: p.id,
-        name: p.name,
-        avatar: p.avatar,
-        score: p.score,
-        streak: p.streak,
-        correctCount: p.correctCount,
-        connected: p.socketId !== null,
-        answered: inRound && p.answer !== null,
-        lastPoints: revealed ? (p.answer?.points ?? 0) : null,
-        lastCorrect: revealed ? (p.answer?.correct ?? false) : null,
-      })),
-      question: q && {
-        index: room.qIndex,
-        total: room.questions.length,
-        category: q.category,
-        text: q.text,
-        choices: q.choices,
-      },
-      myAnswer: inRound ? (me.answer?.choice ?? null) : null,
-      reveal: q && revealed
-        ? {
-            correctIdx: q.correctIdx,
-            counts: q.choices.map(
-              (_, i) => [...room.players.values()].filter((p) => p.answer?.choice === i).length,
-            ),
-            isLast: room.qIndex >= room.questions.length - 1,
-          }
-        : null,
-    };
+    throw new Error('Room is too busy');
   }
 }
